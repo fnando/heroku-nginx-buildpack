@@ -1,0 +1,110 @@
+#!/bin/bash
+set -ex
+APP_DIR=${APP_DIR-/app}
+BUILD_DIR=$1
+COMPILE_BIN=`readlink -f $0`
+NGINX_VERSION=${NGINX_VERSION-1.9.3}
+PCRE_VERSION=${PCRE_VERSION-8.37}
+CACHE_DIR=${2-/tmp/nginx-cache}
+TEMP_DIR=$(mktemp -d /tmp/nginx.XXXXXXXXXX)
+PREVIOUS_FINGERPRINT_FILE="$CACHE_DIR/nginx/fingerprint"
+BUILDPACK_DIR=$(pwd)
+
+output() {
+  echo "-----> $1"
+}
+
+download_nginx() {
+  (
+    output "Downloading nginx tarball"
+    nginx_tarball_url=http://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz
+    curl -s -L $nginx_tarball_url | tar xz
+  )
+}
+
+download_pcre() {
+  (
+    output "Downloading pcre tarball"
+    pcre_tarball_url=http://garr.dl.sourceforge.net/project/pcre/pcre/${PCRE_VERSION}/pcre-${PCRE_VERSION}.tar.bz2
+    cd nginx-${NGINX_VERSION}
+    curl -s -L $pcre_tarball_url | tar xj
+  )
+}
+
+build_nginx() {
+  (
+    cd nginx-${NGINX_VERSION}
+    output "Configuring nginx"
+    ./configure \
+      --conf-path=/tmp/nginx/nginx.conf \
+      --error-log-path=$APP_DIR/logs/nginx/error.log \
+      --http-log-path=$APP_DIR/logs/nginx/access.log \
+      --with-pcre=pcre-${PCRE_VERSION} \
+      --with-http_ssl_module \
+      --with-http_gzip_static_module \
+      --prefix=/tmp/nginx >> /tmp/nginx-build.log 2>&1
+
+    output "Compiling nginx"
+    make install >> /tmp/nginx-build.log 2>&1
+  )
+}
+
+copy_files_to_cache() {
+  output "Copying nginx files to cache"
+  nginx_cache="$CACHE_DIR/nginx"
+  mkdir -p $nginx_cache
+
+  cp /tmp/nginx/sbin/nginx  $nginx_cache
+  cp /tmp/nginx/mime.types  $nginx_cache
+  cp /tmp/nginx/fingerprint $nginx_cache
+}
+
+copy_files_to_app() {
+  mime_types_file="$BUILD_DIR/config/mime.types"
+  nginx_conf_file="$BUILD_DIR/config/nginx.conf.erb"
+
+  if [[ ! -f "$mime_types_file" ]]; then
+    output "Using default mime.types"
+    cp $BUILDPACK_DIR/config/mime.types $mime_types_file
+  else
+    output "Using custom mime.types"
+  fi
+
+  if [[ ! -f "$nginx_conf_file" ]]; then
+    output "Using default nginx.conf template"
+    cp $BUILDPACK_DIR/config/nginx.conf.erb $nginx_conf_file
+  else
+    output "Using custom nginx.conf template"
+  fi
+
+  cp $CACHE_DIR/nginx/nginx $BUILD_DIR/bin
+  cp $BUILDPACK_DIR/bin/start-nginx $BUILD_DIR/bin
+}
+
+create_fingerprint() {
+  output "Create fingerprint: $(fingerprint)"
+  fingerprint > /tmp/nginx/fingerprint
+}
+
+fingerprint() {
+  file_fingerprint=$(md5sum $COMPILE_BIN | cut -f1 -d' ')
+  echo "$NGINX_VERSION-$file_fingerprint" | md5sum | cut -f1 -d' '
+}
+
+if [[ -f "$PREVIOUS_FINGERPRINT_FILE" ]]; then
+  previous_fingerprint=$(cat $PREVIOUS_FINGERPRINT_FILE)
+  current_fingerprint=$(fingerprint)
+
+  if [[ "$previous_fingerprint" != "$current_fingerprint" ]]; then
+    (
+      cd $TEMP_DIR
+      download_nginx
+      download_pcre
+      build_nginx
+      create_fingerprint
+      copy_files_to_cache
+    )
+  fi
+fi
+
+copy_files_to_app
